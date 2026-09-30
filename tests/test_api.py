@@ -451,3 +451,265 @@ def test_persistence_across_restarts(tmp_path):
     with TestClient(create_app(db_file)) as c2:
         assert c2.get(f"/scenarios/{sid}").status_code == 200
         assert c2.get(f"/scenarios/{sid}/verification").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 协调方案（POST /scenarios/{id}/coordination-plan）
+# ---------------------------------------------------------------------------
+
+def coord_payload() -> dict:
+    """全部故障均有主保护的场景（去掉无保护的 F5）。"""
+    p = base_payload()
+    p["faults"] = [f for f in p["faults"] if f["id"] != "F5"]
+    return p
+
+
+def post_plan(client: TestClient, sid: str, adjustments: list):
+    return client.post(
+        f"/scenarios/{sid}/coordination-plan", json={"adjustments": adjustments}
+    )
+
+
+def test_coordination_plan_ok_and_scenario_untouched(client):
+    sid = create_ok(client, coord_payload())
+    before_scenario = client.get(f"/scenarios/{sid}").json()
+    before_verify = client.get(f"/scenarios/{sid}/verification").json()
+
+    resp = post_plan(client, sid, [
+        {"breaker_id": "CB2", "k_min": 0.5, "k_max": 2.0},
+        {"breaker_id": "CB1", "k_min": 0.5, "k_max": 2.0},
+    ])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["scenario_id"] == sid
+    assert body["status"] == "ok"
+    assert body["reasons"] is None
+
+    # F1 约束 x_CB1 - x_CB2 >= ln(1.8/1.2) = ln 1.5 主导：
+    # min max|ln k| = ln(1.5)/2，解为 k_CB1 = sqrt(1.5), k_CB2 = 1/sqrt(1.5)
+    half = math.log(1.5) / 2
+    assert body["objective"] == pytest.approx(half, rel=1e-6)
+    mults = body["multipliers"]
+    assert [m["breaker_id"] for m in mults] == ["CB1", "CB2"]  # 按 ID 顺序
+    assert mults[0]["k"] == pytest.approx(math.sqrt(1.5), rel=1e-6)
+    assert mults[0]["ln_k"] == pytest.approx(half, rel=1e-6)
+    assert mults[1]["k"] == pytest.approx(1 / math.sqrt(1.5), rel=1e-6)
+    assert mults[1]["ln_k"] == pytest.approx(-half, rel=1e-6)
+
+    # 调整后的逐故障核验：全部合格；F1 恰好等号合格
+    ver = body["verification"]
+    assert ver["summary"] == {
+        "total": 4, "qualified": 4, "unqualified": 0, "unprotected": 0,
+    }
+    f1 = next(f for f in ver["faults"] if f["fault_id"] == "F1")
+    assert f1["status"] == "qualified"
+    assert f1["pairs"][0]["min_ratio"] == pytest.approx(1.8, rel=1e-9)
+    assert f1["pairs"][0]["violations"] == []
+
+    # 原场景与原核验不受影响
+    assert client.get(f"/scenarios/{sid}").json() == before_scenario
+    assert client.get(f"/scenarios/{sid}/verification").json() == before_verify
+
+
+def test_coordination_plan_unknown_scenario_404(client):
+    resp = post_plan(client, "nope", [{"breaker_id": "CB1", "k_min": 1, "k_max": 2}])
+    assert resp.status_code == 404
+
+
+def test_coordination_plan_rejects_bad_requests(client):
+    sid = create_ok(client, coord_payload())
+    # 空调整列表
+    assert post_plan(client, sid, []).status_code == 422
+    # 未知断路器
+    r = post_plan(client, sid, [{"breaker_id": "NOPE", "k_min": 1, "k_max": 2}])
+    assert r.status_code == 422 and "不存在" in r.text
+    # 重复断路器
+    r = post_plan(client, sid, [
+        {"breaker_id": "CB1", "k_min": 1, "k_max": 2},
+        {"breaker_id": "CB1", "k_min": 1, "k_max": 3},
+    ])
+    assert r.status_code == 422 and "重复" in r.text
+    # 倒置区间
+    r = post_plan(client, sid, [{"breaker_id": "CB1", "k_min": 2, "k_max": 0.5}])
+    assert r.status_code == 422 and "倒置" in r.text
+    # 非正倍率
+    assert post_plan(client, sid, [
+        {"breaker_id": "CB1", "k_min": 0, "k_max": 2}]).status_code == 422
+    assert post_plan(client, sid, [
+        {"breaker_id": "CB1", "k_min": -1, "k_max": 2}]).status_code == 422
+    # 非有限倍率（JSON 字面量 Infinity -> 服务端解析为 inf -> 拒绝）
+    r = client.post(
+        f"/scenarios/{sid}/coordination-plan",
+        content='{"adjustments": [{"breaker_id": "CB1", "k_min": 1, "k_max": Infinity}]}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+
+
+def test_coordination_plan_rejects_empty_fault_set(client):
+    p = coord_payload()
+    p["faults"] = []
+    sid = create_ok(client, p)
+    r = post_plan(client, sid, [{"breaker_id": "CB1", "k_min": 1, "k_max": 2}])
+    assert r.status_code == 422 and "故障集合为空" in r.text
+
+
+def test_coordination_plan_infeasible_unprotected(client):
+    sid = create_ok(client, base_payload())  # 含无保护的 F5
+    resp = post_plan(client, sid, [
+        {"breaker_id": "CB1", "k_min": 0.5, "k_max": 2.0},
+        {"breaker_id": "CB2", "k_min": 0.5, "k_max": 2.0},
+    ])
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "infeasible"
+    # 无解：不返回方案
+    assert body["multipliers"] is None
+    assert body["verification"] is None
+    assert body["objective"] is None
+    reasons = body["reasons"]
+    assert reasons["unprotected_faults"] == ["F5"]
+    assert reasons["unadjusted_pair_violations"] == []
+    assert reasons["constraint_conflict"] is False
+
+
+def test_coordination_plan_infeasible_unadjusted_pair(client):
+    # 三级链 CB1(慢)->CB2(中)->CB3(快)，故障在末端无断路器支路
+    p = base_payload()
+    p["branches"] = [
+        {"id": "L1", "from": "S", "to": "A",
+         "breaker": {"id": "CB1", "curve_id": "C_SLOW"}},
+        {"id": "L2", "from": "A", "to": "B",
+         "breaker": {"id": "CB2", "curve_id": "C_MID"}},
+        {"id": "L3", "from": "B", "to": "C",
+         "breaker": {"id": "CB3", "curve_id": "C_FAST"}},
+        {"id": "L4", "from": "C", "to": "D"},
+    ]
+    p["curves"] = [
+        {"id": "C_FAST", "points": [
+            {"current": 10, "time": 1}, {"current": 100, "time": 0.1}]},
+        {"id": "C_MID", "points": [
+            {"current": 10, "time": 1.5}, {"current": 100, "time": 0.15}]},
+        {"id": "C_SLOW", "points": [
+            {"current": 10, "time": 2}, {"current": 100, "time": 0.2}]},
+    ]
+    p["faults"] = [
+        {"id": "FX", "branch_id": "L4",
+         "current_min": 10, "current_max": 100, "r": 1.8},
+    ]
+    sid = create_ok(client, p)
+    # 只调整 CB1：违规配对 (CB3 主, CB2 上) 双方都未调整，无法修复
+    resp = post_plan(client, sid, [{"breaker_id": "CB1", "k_min": 0.5, "k_max": 2.0}])
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "infeasible"
+    reasons = body["reasons"]
+    assert reasons["unprotected_faults"] == []
+    assert reasons["constraint_conflict"] is False
+    assert len(reasons["unadjusted_pair_violations"]) == 1
+    v = reasons["unadjusted_pair_violations"][0]
+    assert v["fault_id"] == "FX"
+    assert v["main_breaker_id"] == "CB3"
+    assert v["upstream_breaker_id"] == "CB2"
+    assert v["min_ratio"] == pytest.approx(1.5, rel=1e-9)
+    assert v["r"] == pytest.approx(1.8)
+
+
+def test_coordination_plan_infeasible_constraint_conflict(client):
+    sid = create_ok(client, coord_payload())
+    # F1 需要 ln k_CB1 >= ln(1.5)，但 k_max = 1.2 不够 -> 约束冲突
+    resp = post_plan(client, sid, [{"breaker_id": "CB1", "k_min": 1.0, "k_max": 1.2}])
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "infeasible"
+    reasons = body["reasons"]
+    assert reasons["unprotected_faults"] == []
+    assert reasons["unadjusted_pair_violations"] == []
+    assert reasons["constraint_conflict"] is True
+
+
+def test_coordination_plan_already_qualified(client):
+    p = coord_payload()
+    p["faults"] = [f for f in p["faults"] if f["id"] in ("F2", "F3", "F4")]
+    sid = create_ok(client, p)
+    body = post_plan(client, sid, [
+        {"breaker_id": "CB1", "k_min": 0.5, "k_max": 2.0},
+        {"breaker_id": "CB2", "k_min": 0.5, "k_max": 2.0},
+    ]).json()
+    assert body["status"] == "ok"
+    assert body["objective"] == pytest.approx(0.0, abs=1e-6)
+    for m in body["multipliers"]:
+        assert m["k"] == pytest.approx(1.0, rel=1e-6)
+
+
+def test_coordination_plan_per_breaker_not_shared_curve(client):
+    # CB1 与 CB2 共用曲线 CS；只调整 CB2，共用曲线的 CB1 不得变化
+    p = base_payload()
+    p["branches"] = [
+        {"id": "L1", "from": "S", "to": "A",
+         "breaker": {"id": "CB0", "curve_id": "C0"}},
+        {"id": "L2", "from": "A", "to": "B",
+         "breaker": {"id": "CB1", "curve_id": "CS"}},
+        {"id": "L3", "from": "B", "to": "C",
+         "breaker": {"id": "CB2", "curve_id": "CS"}},
+    ]
+    p["curves"] = [
+        {"id": "C0", "points": [
+            {"current": 10, "time": 4}, {"current": 100, "time": 0.4}]},
+        {"id": "CS", "points": [
+            {"current": 10, "time": 2}, {"current": 100, "time": 0.2}]},
+    ]
+    p["faults"] = [
+        {"id": "FA", "branch_id": "L3",
+         "current_min": 10, "current_max": 100, "r": 1.5},
+        {"id": "FB", "branch_id": "L2",
+         "current_min": 10, "current_max": 100, "r": 1.5},
+    ]
+    sid = create_ok(client, p)
+    body = post_plan(client, sid, [
+        {"breaker_id": "CB2", "k_min": 0.4, "k_max": 1.0}]).json()
+    assert body["status"] == "ok"
+    # FA 中 CB2(主)/CB1(上) 比值恒为 1.0，需 k_CB2 <= 2/3；字典序最小取 k = 2/3
+    assert len(body["multipliers"]) == 1
+    m = body["multipliers"][0]
+    assert m["breaker_id"] == "CB2"
+    assert m["k"] == pytest.approx(2 / 3, rel=1e-6)
+    faults = {f["fault_id"]: f for f in body["verification"]["faults"]}
+    fa = {p_["upstream_breaker_id"]: p_ for p_ in faults["FA"]["pairs"]}
+    assert fa["CB1"]["min_ratio"] == pytest.approx(1.5, rel=1e-6)  # 等号合格
+    assert fa["CB0"]["min_ratio"] == pytest.approx(3.0, rel=1e-6)
+    # 关键：FB（主 CB1、上 CB0，均未调整）的比值保持 2.0 —— 共用曲线未被联动
+    fb = faults["FB"]["pairs"][0]
+    assert fb["min_ratio"] == pytest.approx(2.0, rel=1e-9)
+
+
+def test_coordination_plan_lexicographic_min_ln_k(client):
+    # 与故障无关的第三台断路器：字典序最小化将其 ln k 压到 -M*（而非 0）
+    p = coord_payload()
+    p["branches"][3]["breaker"] = {"id": "CB3", "curve_id": "C_MAIN"}  # B4: S->D
+    p["faults"] = [f for f in p["faults"] if f["id"] == "F1"]
+    sid = create_ok(client, p)
+    body = post_plan(client, sid, [
+        {"breaker_id": "CB1", "k_min": 0.5, "k_max": 2.0},
+        {"breaker_id": "CB2", "k_min": 0.5, "k_max": 2.0},
+        {"breaker_id": "CB3", "k_min": 0.5, "k_max": 2.0},
+    ]).json()
+    assert body["status"] == "ok"
+    half = math.log(1.5) / 2
+    ln_k = {m["breaker_id"]: m["ln_k"] for m in body["multipliers"]}
+    assert ln_k["CB1"] == pytest.approx(half, rel=1e-6)
+    assert ln_k["CB2"] == pytest.approx(-half, rel=1e-6)
+    assert ln_k["CB3"] == pytest.approx(-half, rel=1e-6)
+
+
+def test_coordination_plan_degenerate_interval(client):
+    sid = create_ok(client, coord_payload())
+    # k 固定为 1.5（闭区间退化为单点）：F1 恰好等号合格
+    body = post_plan(client, sid, [
+        {"breaker_id": "CB1", "k_min": 1.5, "k_max": 1.5}]).json()
+    assert body["status"] == "ok"
+    assert body["multipliers"][0]["k"] == pytest.approx(1.5, rel=1e-9)
+    assert body["objective"] == pytest.approx(math.log(1.5), rel=1e-6)
+    f1 = next(f for f in body["verification"]["faults"] if f["fault_id"] == "F1")
+    assert f1["status"] == "qualified"
+    assert f1["pairs"][0]["min_ratio"] == pytest.approx(1.8, rel=1e-9)

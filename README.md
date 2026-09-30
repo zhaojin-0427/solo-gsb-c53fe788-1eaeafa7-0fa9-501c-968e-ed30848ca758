@@ -29,6 +29,33 @@
 - 浮点容差：`|ln(t上/t主) − ln R| ≤ 1e-9` 视为相等（等号合格）；
   最小比值并列判定相对容差 `1e-9`。
 
+## 协调方案（倍率调整）
+
+`POST /scenarios/{id}/coordination-plan` 为已保存场景求解断路器**倍率协调方案**
+（纯计算接口，不改动场景及原核验）：
+
+- **请求**：非空的断路器倍率列表，每项为断路器 ID 与有限正数倍率闭区间
+  `[k_min, k_max]`。未知或重复的断路器 ID、倒置区间（`k_min > k_max`）、
+  非正/非有限倍率、空列表、场景故障集为空，均返回 **422**。
+- **倍率语义**：断路器动作时间整体乘以 `k`（`ln t` 平移 `ln k`）；倍率按
+  **断路器**施加，共用同一曲线的其他断路器不受影响；未指定的断路器倍率恒为 1。
+- **约束**：要求全部故障有主保护；沿用折点分段求得的原始最小比值 `m`，
+  联立所有配对的 `m·k上/k主 ≥ R`（等号合格）与各自倍率边界。对数化后为
+  差分约束系统（`x上 − x主 ≥ ln R − ln m`，`x = ln k`），用 Bellman-Ford
+  判可行并对主目标二分求解。
+- **优化目标**（有解时）：先最小化所选断路器的 `max|ln k|`，再按断路器 ID
+  顺序字典序最小化 `ln k`（差分约束系统的分量最小解即字典序最小解）。
+- **有解**（`status=ok`）：返回所选断路器的倍率（按 ID 顺序）、目标值
+  `objective = max|ln k|`，以及施加倍率后的逐故障核验结果
+  （`verification`，结构同 `GET /scenarios/{id}/verification`）。
+- **无解**（`status=infeasible`，HTTP 200）：不返回方案
+  （`multipliers`/`verification`/`objective` 为 `null`），`reasons`
+  分类给出原因——
+  - `unprotected_faults`：无主保护的故障；
+  - `unadjusted_pair_violations`：主保护与上级均未指定倍率、且原始最小
+    比值已违规的配对（倍率无法修复）；
+  - `constraint_conflict`：可调整配对的约束与倍率边界联立后无可行解。
+
 ## 快速开始
 
 ### Docker Compose（一键启动）
@@ -68,6 +95,7 @@ pytest
 | GET | `/scenarios/{id}` | 读取场景原文 |
 | GET | `/scenarios/{id}/verification` | 核验场景内全部故障 |
 | GET | `/scenarios/{id}/faults/{fault_id}/verification` | 核验单个故障 |
+| POST | `/scenarios/{id}/coordination-plan` | 求解断路器倍率协调方案（不改动场景） |
 
 交互式文档（Swagger UI）：<http://localhost:8000/docs>（OpenAPI：`/openapi.json`）。
 
@@ -289,16 +317,165 @@ curl -s -X POST http://localhost:8000/scenarios \
 }
 ```
 
+### 7. 协调方案：有解（HTTP 200，`status=ok`）
+
+示例场景见 [`examples/coordination-scenario.json`](examples/coordination-scenario.json)
+（与 `examples/scenario.json` 同拓扑同曲线，故障为 F1–F4，均有主保护），
+请求体见 [`examples/coordination-request.json`](examples/coordination-request.json)：
+
+```bash
+curl -s -X POST http://localhost:8000/scenarios \
+  -H 'Content-Type: application/json' \
+  -d @examples/coordination-scenario.json        # 201，记返回 id 为 <id2>
+
+curl -s -X POST http://localhost:8000/scenarios/<id2>/coordination-plan \
+  -H 'Content-Type: application/json' \
+  -d @examples/coordination-request.json
+```
+
+请求体：
+
+```json
+{
+  "adjustments": [
+    {"breaker_id": "CB1", "k_min": 0.5, "k_max": 2.0},
+    {"breaker_id": "CB2", "k_min": 0.5, "k_max": 2.0}
+  ]
+}
+```
+
+响应 `200 OK`（F1 要求 `k_CB1/k_CB2 ≥ 1.8/1.2 = 1.5`，最优解为
+`k_CB1 = √1.5 ≈ 1.2247`、`k_CB2 = 1/√1.5 ≈ 0.8165`，目标值 `ln(1.5)/2 ≈ 0.20273`）：
+
+```json
+{
+  "scenario_id": "9772d042a32341f0ad90fe0e49bf6d5f",
+  "status": "ok",
+  "objective": 0.20273255505358234,
+  "multipliers": [
+    {"breaker_id": "CB1", "k": 1.2247448701674568, "ln_k": 0.20273255305458232},
+    {"breaker_id": "CB2", "k": 0.8164965801116376, "ln_k": -0.20273255505358234}
+  ],
+  "verification": {
+    "scenario_id": "9772d042a32341f0ad90fe0e49bf6d5f",
+    "scenario_name": "coordination-demo",
+    "summary": {"total": 4, "qualified": 4, "unqualified": 0, "unprotected": 0},
+    "faults": [
+      {
+        "fault_id": "F1", "branch_id": "B3", "status": "qualified",
+        "main_breaker_id": "CB2",
+        "pairs": [
+          {"upstream_breaker_id": "CB1", "min_ratio": 1.8,
+           "min_ratio_current": 1000.0, "qualified": true, "violations": []}
+        ]
+      },
+      {
+        "fault_id": "F2", "branch_id": "B3", "status": "qualified",
+        "main_breaker_id": "CB2",
+        "pairs": [
+          {"upstream_breaker_id": "CB1", "min_ratio": 1.8,
+           "min_ratio_current": 1000.0, "qualified": true, "violations": []}
+        ]
+      },
+      {
+        "fault_id": "F3", "branch_id": "B2", "status": "qualified",
+        "main_breaker_id": "CB2",
+        "pairs": [
+          {"upstream_breaker_id": "CB1", "min_ratio": 2.2500000000000004,
+           "min_ratio_current": 100.0, "qualified": true, "violations": []}
+        ]
+      },
+      {
+        "fault_id": "F4", "branch_id": "B1", "status": "qualified",
+        "main_breaker_id": "CB1", "pairs": []
+      }
+    ]
+  },
+  "reasons": null
+}
+```
+
+调整后 F1 的最小时间比恰为 1.8（**等号合格**），全部故障合格；
+原场景的 `GET /scenarios/<id2>/verification` 结论保持不变
+（仍为 `qualified: 3, unqualified: 1`）。
+
+### 8. 协调方案：无解——无保护故障（HTTP 200，`status=infeasible`）
+
+对第 1 步的 `demo-feeder` 场景（含无保护故障 F5）提交同一请求：
+
+```bash
+curl -s -X POST http://localhost:8000/scenarios/<id>/coordination-plan \
+  -H 'Content-Type: application/json' \
+  -d @examples/coordination-request.json
+```
+
+```json
+{
+  "scenario_id": "7d427391d0fe4db58fa3d56aaa6ddb40",
+  "status": "infeasible",
+  "objective": null,
+  "multipliers": null,
+  "verification": null,
+  "reasons": {
+    "unprotected_faults": ["F5"],
+    "unadjusted_pair_violations": [],
+    "constraint_conflict": false
+  }
+}
+```
+
+### 9. 协调方案：无解——约束冲突（HTTP 200，`status=infeasible`）
+
+F1 需要 `k_CB1 ≥ 1.5`，但请求只允许 `k_CB1 ≤ 1.2`：
+
+```bash
+curl -s -X POST http://localhost:8000/scenarios/<id2>/coordination-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"adjustments": [{"breaker_id": "CB1", "k_min": 1.0, "k_max": 1.2}]}'
+```
+
+```json
+{
+  "scenario_id": "9772d042a32341f0ad90fe0e49bf6d5f",
+  "status": "infeasible",
+  "objective": null,
+  "multipliers": null,
+  "verification": null,
+  "reasons": {
+    "unprotected_faults": [],
+    "unadjusted_pair_violations": [],
+    "constraint_conflict": true
+  }
+}
+```
+
+### 10. 协调方案：请求校验失败（HTTP 422）
+
+未知断路器（重复 ID、倒置区间、非正/非有限倍率、空列表、空故障集同理）：
+
+```bash
+curl -s -X POST http://localhost:8000/scenarios/<id2>/coordination-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"adjustments": [{"breaker_id": "CB9", "k_min": 1, "k_max": 2}]}'
+```
+
+```json
+{"detail": ["调整的断路器在场景中不存在: 'CB9'"]}
+```
+
 ## 项目结构
 
 ```
 ├── app/
 │   ├── main.py       # FastAPI 入口与路由
 │   ├── core.py       # 领域校验 + 选择性分析引擎（log-log 分段求值）
+│   │                 #   + 协调方案求解（差分约束 + Bellman-Ford + 目标二分）
 │   ├── schemas.py    # Pydantic 请求/响应模型
 │   └── db.py         # SQLite 场景仓库（不可变文档）
-├── tests/test_api.py # 端到端与算法单元测试（23 例）
+├── tests/test_api.py # 端到端与算法单元测试（34 例）
 ├── examples/scenario.json
+├── examples/coordination-scenario.json
+├── examples/coordination-request.json
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

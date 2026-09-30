@@ -4,7 +4,7 @@
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -145,3 +145,79 @@ class VerifyResponseOut(BaseModel):
     scenario_name: str
     summary: VerifySummaryOut
     faults: list[FaultReportOut]
+
+
+# ---------------------------------------------------------------------------
+# 协调方案（断路器倍率调整）模型
+# ---------------------------------------------------------------------------
+
+class BreakerAdjustmentIn(BaseModel):
+    """单台断路器的倍率范围：有限正数闭区间 [k_min, k_max]。"""
+
+    breaker_id: str = Field(min_length=1)
+    k_min: FiniteFloat = Field(gt=0, description="倍率下界（有限正数）")
+    k_max: FiniteFloat = Field(gt=0, description="倍率上界（有限正数）")
+
+    @model_validator(mode="after")
+    def _interval_valid(self) -> "BreakerAdjustmentIn":
+        if self.k_min > self.k_max:
+            raise ValueError(
+                f"断路器 {self.breaker_id} 的倍率区间倒置: "
+                f"k_min {self.k_min} 大于 k_max {self.k_max}"
+            )
+        return self
+
+
+class CoordinationPlanIn(BaseModel):
+    """协调方案请求：非空的断路器倍率区间列表（未列出者倍率固定为 1）。"""
+
+    adjustments: list[BreakerAdjustmentIn] = Field(min_length=1)
+
+
+class BreakerMultiplierOut(BaseModel):
+    """一台所选断路器的倍率解。"""
+
+    breaker_id: str
+    k: float = Field(description="倍率：该断路器动作时间整体乘以 k")
+    ln_k: float = Field(description="ln k")
+
+
+class UnadjustedPairViolationOut(BaseModel):
+    """主保护与上级均未指定倍率、且原始最小比值已违规的配对。"""
+
+    fault_id: str
+    main_breaker_id: str
+    upstream_breaker_id: str
+    min_ratio: float = Field(description="原始最小时间比 t上/t主")
+    r: float = Field(description="选择性门槛")
+
+
+class InfeasibleReasonsOut(BaseModel):
+    """无解原因的分类诊断。"""
+
+    unprotected_faults: list[str] = Field(description="无主保护的故障 id 列表")
+    unadjusted_pair_violations: list[UnadjustedPairViolationOut] = Field(
+        description="配对双方均未调整、原本即违规（无法通过倍率修复）的配对"
+    )
+    constraint_conflict: bool = Field(
+        description="可调整配对的约束与倍率边界联立后无可行解"
+    )
+
+
+class CoordinationPlanOut(BaseModel):
+    scenario_id: str
+    status: str = Field(description="ok=有解 / infeasible=无解（不返回方案）")
+    objective: float | None = Field(
+        default=None, description="主目标值 max|ln k|（无解时为 null）"
+    )
+    multipliers: list[BreakerMultiplierOut] | None = Field(
+        default=None,
+        description="所选断路器的倍率（按 ID 顺序；未指定的断路器倍率为 1）",
+    )
+    verification: VerifyResponseOut | None = Field(
+        default=None,
+        description="施加倍率后的逐故障核验结果（原场景与原核验不受影响）",
+    )
+    reasons: InfeasibleReasonsOut | None = Field(
+        default=None, description="无解原因分类（有解时为 null）"
+    )

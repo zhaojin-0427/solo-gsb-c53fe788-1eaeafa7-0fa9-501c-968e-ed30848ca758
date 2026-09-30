@@ -16,10 +16,15 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from .schemas import (
+    BreakerMultiplierOut,
+    CoordinationPlanIn,
+    CoordinationPlanOut,
     FaultIn,
     FaultReportOut,
+    InfeasibleReasonsOut,
     PairResultOut,
     ScenarioIn,
+    UnadjustedPairViolationOut,
     VerifyResponseOut,
     VerifySummaryOut,
     ViolationOut,
@@ -289,8 +294,13 @@ def evaluate_fault(
     scenario: ScenarioIn,
     fault: FaultIn,
     curves: dict[str, Curve],
+    ln_k: dict[str, float] | None = None,
 ) -> FaultReportOut:
-    """评估单个故障的选择性结论。"""
+    """评估单个故障的选择性结论。
+
+    ln_k 非空时按断路器施加倍率（ln_k[breaker_id] = ln k，缺省为 0 即 k=1）。
+    倍率只平移对应断路器自身的曲线；共用同一曲线的其他断路器不受影响。
+    """
     path = list(_path_breakers(scenario, fault.branch_id))
     if not path:
         return FaultReportOut(
@@ -302,17 +312,23 @@ def evaluate_fault(
         )
     main_breaker = path[0]
     main_curve = curves[main_breaker.curve_id]
-    pairs = [
-        analyze_pair(
-            main_curve,
-            curves[up.curve_id],
-            fault.current_min,
-            fault.current_max,
-            fault.r,
-            up.id,
+    if ln_k:
+        main_curve = _shift_curve(main_curve, ln_k.get(main_breaker.id, 0.0))
+    pairs = []
+    for up in path[1:]:
+        up_curve = curves[up.curve_id]
+        if ln_k:
+            up_curve = _shift_curve(up_curve, ln_k.get(up.id, 0.0))
+        pairs.append(
+            analyze_pair(
+                main_curve,
+                up_curve,
+                fault.current_min,
+                fault.current_max,
+                fault.r,
+                up.id,
+            )
         )
-        for up in path[1:]
-    ]
     status = "qualified" if all(p.qualified for p in pairs) else "unqualified"
     return FaultReportOut(
         fault_id=fault.id,
@@ -324,13 +340,15 @@ def evaluate_fault(
 
 
 def verify_scenario(
-    scenario_id: str, scenario: ScenarioIn
+    scenario_id: str,
+    scenario: ScenarioIn,
+    ln_k: dict[str, float] | None = None,
 ) -> VerifyResponseOut:
-    """对场景内全部故障给出选择性结论。"""
+    """对场景内全部故障给出选择性结论（ln_k 非空时为施加倍率后的核验）。"""
     curves = {
         c.id: Curve.from_points(c.id, c.points) for c in scenario.curves
     }
-    reports = [evaluate_fault(scenario, f, curves) for f in scenario.faults]
+    reports = [evaluate_fault(scenario, f, curves, ln_k) for f in scenario.faults]
     summary = VerifySummaryOut(
         total=len(reports),
         qualified=sum(1 for r in reports if r.status == "qualified"),
@@ -342,4 +360,203 @@ def verify_scenario(
         scenario_name=scenario.name,
         summary=summary,
         faults=reports,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 协调方案（断路器倍率调整）
+# ---------------------------------------------------------------------------
+#
+# 数学模型：对所选断路器 b 令 x_b = ln k_b（未指定的断路器 k=1，即 x=0，
+# 用固定为 0 的源点表示）。每对（主保护, 上级）在故障电流全区间的选择性
+# 要求 m·k上/k主 >= R（m 为折点分段求得的原始最小比值，等号合格），取对数
+# 后全部为差分约束：
+#
+#     x_上 - x_主 >= ln R - ln m,   ln k_min <= x_b <= ln k_max
+#
+# 差分约束系统无可行解当且仅当约束图存在正环（Bellman-Ford 判定）；给定
+# 上限 M 时加入 -M <= x_b <= M 即可二分主目标 min max|x_b|。系统的最长路
+# 解是分量最小的可行解，因此自动就是按断路器 ID 顺序字典序最小化 ln k 的解。
+
+# 正环（不可行）判定的相对容差：仅吸收浮点误差。
+CYCLE_EPS = 1e-12
+# 主目标二分迭代次数（精度远高于后续数值误差，足够）。
+_OBJ_BISECT_ITERS = 60
+
+
+def _shift_curve(curve: Curve, ln_k: float) -> Curve:
+    """动作时间整体乘以 k（ln t 平移 ln k）；k=1 时返回原曲线。"""
+    if ln_k == 0.0:
+        return curve
+    return Curve(
+        id=curve.id,
+        currents=curve.currents,
+        log_currents=curve.log_currents,
+        log_times=tuple(lt + ln_k for lt in curve.log_times),
+    )
+
+
+def _longest_paths(n_nodes: int, edges: list[tuple[int, int, float]]):
+    """差分约束系统 x_v >= x_u + w（节点 0 固定 x_0 = 0）的分量最小解。
+
+    边 (u, v, w) 表示 x_v >= x_u + w。返回各节点最长路；存在正环
+    （系统不可行）时返回 None。
+    """
+    dist = [float("-inf")] * n_nodes
+    dist[0] = 0.0
+    for _ in range(n_nodes - 1):
+        updated = False
+        for u, v, w in edges:
+            du = dist[u]
+            if du == float("-inf"):
+                continue
+            cand = du + w
+            if cand > dist[v]:
+                dist[v] = cand
+                updated = True
+        if not updated:
+            break
+    for u, v, w in edges:
+        du = dist[u]
+        if du == float("-inf"):
+            continue
+        tol = CYCLE_EPS * max(1.0, abs(du), abs(dist[v]), abs(w))
+        if du + w > dist[v] + tol:
+            return None
+    return dist
+
+
+def _solve_multipliers(
+    bounds: list[tuple[float, float]],
+    pair_edges: list[tuple[int, int, float]],
+):
+    """求解倍率调整：先 min max|x_i|，再按变量顺序（断路器 ID 序）字典序最小化 x。
+
+    bounds[i] = (ln k_min, ln k_max) 对应节点 i+1；pair_edges 中 (u, v, c)
+    表示 x_v - x_u >= c（节点 0 固定为 0，即未指定断路器 k=1）。
+    返回 [x_0, x_1, ...]（x_0 = 0）；不可行返回 None。
+    """
+    n = len(bounds)
+
+    def edges(m_cap: float) -> list[tuple[int, int, float]]:
+        es = list(pair_edges)
+        for i, (lo_i, hi_i) in enumerate(bounds, start=1):
+            es.append((0, i, max(lo_i, -m_cap)))
+            es.append((i, 0, -min(hi_i, m_cap)))
+        return es
+
+    # 上界内可行性 = 原系统可行性（m_cap 覆盖全部边界时收紧无效）
+    m_hi = max(max(abs(lo), abs(hi)) for lo, hi in bounds)
+    if _longest_paths(n + 1, edges(m_hi)) is None:
+        return None
+    lo_m, hi_m = 0.0, m_hi
+    for _ in range(_OBJ_BISECT_ITERS):
+        mid = 0.5 * (lo_m + hi_m)
+        if _longest_paths(n + 1, edges(mid)) is not None:
+            hi_m = mid
+        else:
+            lo_m = mid
+    # 微小松弛，吸收二分与正环判定的数值误差
+    m_cap = hi_m + 1e-9 * max(1.0, hi_m)
+    return _longest_paths(n + 1, edges(m_cap))
+
+
+def build_coordination_plan(
+    scenario_id: str,
+    scenario: ScenarioIn,
+    req: CoordinationPlanIn,
+) -> CoordinationPlanOut:
+    """对已保存场景求解断路器倍率协调方案（不改动场景及原核验）。
+
+    请求校验失败（未知/重复断路器、空故障集）抛出 DomainError（HTTP 422）；
+    无解时返回 status=infeasible 及分类原因，不返回方案。
+    """
+    errors: list[str] = []
+    known_breakers = {
+        b.breaker.id for b in scenario.branches if b.breaker is not None
+    }
+    seen: set[str] = set()
+    for adj in req.adjustments:
+        if adj.breaker_id in seen:
+            errors.append(f"调整的断路器 id 重复: {adj.breaker_id!r}")
+        seen.add(adj.breaker_id)
+        if adj.breaker_id not in known_breakers:
+            errors.append(f"调整的断路器在场景中不存在: {adj.breaker_id!r}")
+    if not scenario.faults:
+        errors.append("场景的故障集合为空，无法生成协调方案")
+    if errors:
+        raise DomainError(errors)
+
+    curves = {
+        c.id: Curve.from_points(c.id, c.points) for c in scenario.curves
+    }
+    selected = {
+        a.breaker_id: (math.log(a.k_min), math.log(a.k_max))
+        for a in req.adjustments
+    }
+
+    # 逐故障收集约束：x_上 - x_主 >= ln R - ln m（m 为原始最小比值）
+    unprotected: list[str] = []
+    unadjusted: list[UnadjustedPairViolationOut] = []
+    pair_refs: list[tuple[str | None, str | None, float]] = []
+    for fault in scenario.faults:
+        report = evaluate_fault(scenario, fault, curves)
+        if report.status == "unprotected":
+            unprotected.append(fault.id)
+            continue
+        main_id = report.main_breaker_id
+        for pair in report.pairs:
+            up_id = pair.upstream_breaker_id
+            c = math.log(fault.r) - math.log(pair.min_ratio)
+            main_sel = main_id in selected
+            up_sel = up_id in selected
+            if not main_sel and not up_sel:
+                # 双方均未调整：k 恒为 1，退化为原始结论 m >= R（等号合格）
+                if c > LOG_EPS:
+                    unadjusted.append(
+                        UnadjustedPairViolationOut(
+                            fault_id=fault.id,
+                            main_breaker_id=main_id,
+                            upstream_breaker_id=up_id,
+                            min_ratio=pair.min_ratio,
+                            r=fault.r,
+                        )
+                    )
+            else:
+                pair_refs.append(
+                    (main_id if main_sel else None, up_id if up_sel else None, c)
+                )
+
+    ids = sorted(selected)  # 字典序优化按断路器 ID 顺序
+    node = {bid: i + 1 for i, bid in enumerate(ids)}
+    pair_edges = [
+        (node[m] if m is not None else 0, node[u] if u is not None else 0, c)
+        for m, u, c in pair_refs
+    ]
+    bounds = [selected[bid] for bid in ids]
+    x = _solve_multipliers(bounds, pair_edges)
+
+    if unprotected or unadjusted or x is None:
+        return CoordinationPlanOut(
+            scenario_id=scenario_id,
+            status="infeasible",
+            reasons=InfeasibleReasonsOut(
+                unprotected_faults=unprotected,
+                unadjusted_pair_violations=unadjusted,
+                constraint_conflict=x is None,
+            ),
+        )
+
+    ln_k = {bid: x[node[bid]] for bid in ids}
+    return CoordinationPlanOut(
+        scenario_id=scenario_id,
+        status="ok",
+        objective=max(abs(v) for v in ln_k.values()),
+        multipliers=[
+            BreakerMultiplierOut(
+                breaker_id=bid, k=math.exp(ln_k[bid]), ln_k=ln_k[bid]
+            )
+            for bid in ids
+        ],
+        verification=verify_scenario(scenario_id, scenario, ln_k),
     )
