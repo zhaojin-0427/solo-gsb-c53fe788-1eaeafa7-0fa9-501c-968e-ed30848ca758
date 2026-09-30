@@ -4,7 +4,9 @@
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+import math
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +100,83 @@ class ScenarioSummary(BaseModel):
     branch_count: int
     curve_count: int
     fault_count: int
+
+
+# ---------------------------------------------------------------------------
+# 配合方案（倍率调整）模型
+# ---------------------------------------------------------------------------
+
+class MultiplierIn(BaseModel):
+    """所选断路器及其倍率闭区间 [k_min, k_max]（均为有限正数，k_min <= k_max）。"""
+
+    id: str = Field(min_length=1, description="断路器 id")
+    k_min: float = Field(gt=0, description="倍率下界（正数）")
+    k_max: float = Field(gt=0, description="倍率上界（正数）")
+
+    @field_validator("k_min", "k_max", mode="before")
+    @classmethod
+    def _reject_non_finite(cls, v: object) -> object:
+        # 必须先于 gt=0 拦截 NaN：NaN 的任何比较均为 False，会逃逸字段约束，
+        # 且其值回显进错误响应时无法被 JSON 序列化（500）。
+        if isinstance(v, float) and not math.isfinite(v):
+            raise ValueError("倍率必须为有限正数（拒绝 NaN/Infinity）")
+        return v
+
+    @model_validator(mode="after")
+    def _interval_valid(self) -> "MultiplierIn":
+        if self.k_min > self.k_max:
+            raise ValueError(
+                f"断路器 {self.id} 的倍率区间倒置: "
+                f"k_min={self.k_min} > k_max={self.k_max}"
+            )
+        return self
+
+
+class CoordinationPlanIn(BaseModel):
+    """倍率调整请求：非空的断路器倍率列表（id 不可重复）。"""
+
+    breakers: list[MultiplierIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _no_duplicate_ids(self) -> "CoordinationPlanIn":
+        seen: set[str] = set()
+        for b in self.breakers:
+            if b.id in seen:
+                raise ValueError(f"断路器 id 重复: {b.id!r}")
+            seen.add(b.id)
+        return self
+
+
+class MultiplierOut(BaseModel):
+    id: str
+    k: float = Field(description="求得的倍率（动作时间乘数）")
+    ln_k: float = Field(description="ln(k)，字典序优化所用变量")
+    k_min: float
+    k_max: float
+
+
+class CoordinationObjectiveOut(BaseModel):
+    max_abs_ln_k: float = Field(
+        description="主目标：所选断路器中 max|ln k|（越小调整幅度越小）"
+    )
+    lexicographic_ln_k: list[float] = Field(
+        description="次目标：按断路器 id 字典序排列的 ln k（在主目标最优下字典序最小）"
+    )
+
+
+class CoordinationPlanOut(BaseModel):
+    scenario_id: str
+    scenario_name: str
+    feasible: bool = Field(
+        default=True, description="有解时恒为 true（无解返回 422，不返回方案）"
+    )
+    multipliers: list[MultiplierOut] = Field(
+        description="所选断路器的倍率（按 id 字典序）；未列出者倍率为 1"
+    )
+    objective: CoordinationObjectiveOut
+    verification: VerifyResponseOut = Field(
+        description="应用倍率后逐故障的重新核验结果（不改动原场景与原核验）"
+    )
 
 
 # ---------------------------------------------------------------------------

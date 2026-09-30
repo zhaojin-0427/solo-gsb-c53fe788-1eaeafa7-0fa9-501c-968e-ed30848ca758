@@ -29,6 +29,37 @@
 - 浮点容差：`|ln(t上/t主) − ln R| ≤ 1e-9` 视为相等（等号合格）；
   最小比值并列判定相对容差 `1e-9`。
 
+### 倍率配合方案（POST /scenarios/{id}/coordination-plan）
+
+在**不修改已保存场景**的前提下，为所选断路器求一组动作时间**倍率** `k`
+（新动作时间 = `k · 原动作时间`，仅作用于该断路器；共用同一曲线的其他断路器
+不受影响，未指定的断路器倍率恒为 1），使**全部故障**满足选择性。
+
+- **请求**：非空列表，每项给出断路器 id 与有限正数倍率闭区间
+  `[k_min, k_max]`（允许相等）；未知 id、重复 id、倒置区间、空故障集均返回
+  **422**。
+- **约束**：每个故障必须有主保护。对每对主保护 `m` 与上级 `u`，沿用折点
+  分段求得的**原始最小比值** `m`（倍率全为 1 时的 `min(t上/t主)`），联立::
+
+      m · k上 / k主 ≥ R  （即 ln k主 − ln k上 ≤ ln m − ln R，等号合格）
+
+  连同每台所选断路器的边界 `ln k_min ≤ ln k ≤ ln k_max`（未选者 `ln k = 0`），
+  构成**差分约束系统**（可行 ⇔ 约束图无负环，Bellman–Ford 判定）。
+- **优化目标**（两级，均有唯一值）：
+  1. 先最小化所选断路器的 `max |ln k|`（调整幅度最小）；对
+     `z = max|ln k|` 在可行区间上二分；
+  2. 再在该最优可行域内按断路器 **id 字典序逐维最小化 `ln k`**
+     （差分约束下每维最小可行值取“节点到常量节点最短路”的负值，逐维固定）。
+- **无解（422，不返回方案）时分三类报告**：
+  - **无保护故障**：故障路径上无任何断路器；
+  - **未调整配对违规**：某主保护与上级**均未指定**倍率（恒为 1），原始最小
+    比值已低于 R，任何方案都无法修复；
+  - **约束冲突**：排除上述两类后，倍率边界与配对约束联立仍无解（例如两边界
+    都钉死为 1 而原核验不合格）。三类原因可同时出现、一并列出。
+- **响应**：按 id 字典序返回每台所选断路器的 `k`、`ln_k` 及区间，两个目标值
+  （`max_abs_ln_k` 与字典序 `ln k` 向量），以及**应用倍率后逐故障重新核验**
+  的完整结果。原场景文档与原核验接口结果均不改变。
+
 ## 快速开始
 
 ### Docker Compose（一键启动）
@@ -68,6 +99,7 @@ pytest
 | GET | `/scenarios/{id}` | 读取场景原文 |
 | GET | `/scenarios/{id}/verification` | 核验场景内全部故障 |
 | GET | `/scenarios/{id}/faults/{fault_id}/verification` | 核验单个故障 |
+| POST | `/scenarios/{id}/coordination-plan` | 在给定倍率闭区间内求配合方案（不改原场景，返回调整后核验） |
 
 交互式文档（Swagger UI）：<http://localhost:8000/docs>（OpenAPI：`/openapi.json`）。
 
@@ -260,7 +292,130 @@ curl -s http://localhost:8000/scenarios/<id>/faults/F1/verification
 }
 ```
 
-### 5. 错误示例：非树拓扑（HTTP 422）
+### 5. 求倍率配合方案
+
+先保存一个仅含有保护故障的场景
+[`examples/coordination-scenario.json`](examples/coordination-scenario.json)
+（曲线与标准示例相同，故障 F1/F2/F3 路径上均有断路器），再提交配合请求
+[`examples/coordination-plan.json`](examples/coordination-plan.json)，
+为 CB1、CB2 各给出倍率闭区间 `[0.5, 2]`：
+
+```bash
+# 1) 保存场景
+SID=$(curl -s -X POST http://localhost:8000/scenarios \
+  -H 'Content-Type: application/json' \
+  -d @examples/coordination-scenario.json | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+# 2) 求配合方案
+curl -s -X POST http://localhost:8000/scenarios/$SID/coordination-plan \
+  -H 'Content-Type: application/json' \
+  -d @examples/coordination-plan.json
+```
+
+请求体：
+
+```json
+{
+  "breakers": [
+    {"id": "CB1", "k_min": 0.5, "k_max": 2.0},
+    {"id": "CB2", "k_min": 0.5, "k_max": 2.0}
+  ]
+}
+```
+
+该场景 F1 的原始最小比值为 `m = 1.2 @1000A < R = 1.8`。约束
+`1.2 · k_CB1 / k_CB2 ≥ 1.8` 即 `ln k_CB2 − ln k_CB1 ≤ ln(2/3)`。两级优化得到
+`z* = ½ ln 1.5 ≈ 0.20273`，故 `k_CB1 = √1.5 ≈ 1.2247`、
+`k_CB2 = √(2/3) ≈ 0.8165`（调整后 F1 最小比值恰为 1.8，**等号合格**）：
+
+```json
+{
+  "scenario_id": "3fbc8553313447c2b0886f6c3aaa6fd7",
+  "scenario_name": "coord-demo",
+  "feasible": true,
+  "multipliers": [
+    {"id": "CB1", "k": 1.224744871269176, "ln_k": 0.2027325539541323,
+     "k_min": 0.5, "k_max": 2.0},
+    {"id": "CB2", "k": 0.8164965808461171, "ln_k": -0.20273255415403235,
+     "k_min": 0.5, "k_max": 2.0}
+  ],
+  "objective": {
+    "max_abs_ln_k": 0.20273255415403235,
+    "lexicographic_ln_k": [0.2027325539541323, -0.20273255415403235]
+  },
+  "verification": {
+    "scenario_id": "3fbc8553313447c2b0886f6c3aaa6fd7",
+    "scenario_name": "coord-demo",
+    "summary": {"total": 3, "qualified": 3, "unqualified": 0, "unprotected": 0},
+    "faults": [
+      {
+        "fault_id": "F1", "branch_id": "B3", "status": "qualified",
+        "main_breaker_id": "CB2",
+        "pairs": [
+          {"upstream_breaker_id": "CB1", "min_ratio": 1.8000000000000005,
+           "min_ratio_current": 1000.0, "qualified": true, "violations": []}
+        ]
+      },
+      {
+        "fault_id": "F2", "branch_id": "B3", "status": "qualified",
+        "main_breaker_id": "CB2",
+        "pairs": [
+          {"upstream_breaker_id": "CB1", "min_ratio": 1.8000000000000005,
+           "min_ratio_current": 1000.0, "qualified": true, "violations": []}
+        ]
+      },
+      {
+        "fault_id": "F3", "branch_id": "B2", "status": "qualified",
+        "main_breaker_id": "CB2",
+        "pairs": [
+          {"upstream_breaker_id": "CB1", "min_ratio": 2.2500000000000004,
+           "min_ratio_current": 100.0, "qualified": true, "violations": []}
+        ]
+      }
+    ]
+  }
+}
+```
+
+> 说明：上面的场景 `coord-demo` 与标准示例的曲线相同，故障为 F1（R=1.8）、
+> F2（R=1.1）、F3（R=1.5）三个有保护故障。倍率只乘各自断路器：CB1 放慢
+> 22.5%、CB2 加快至 81.6%；响应中的核验是按调整后动作时间**重新逐故障计算**
+> 的，原场景与 `GET .../verification` 的结果保持不变。若把两台倍率都钉死为
+> `[1, 1]`，约束无法满足，返回 **422**：
+>
+> ```json
+> {"detail": ["倍率边界与全部配对选择性约束 m·k上/k主 ≥ R 无解（约束冲突），不返回方案"]}
+> ```
+>
+> 其他 422 情形，例如含无保护故障时同时报告多类原因：
+>
+> ```json
+> {
+>   "detail": [
+>     "故障 'F5' 无主保护（故障支路到电源路径上无断路器），无法配合",
+>     "倍率边界与全部配对选择性约束 m·k上/k主 ≥ R 无解（约束冲突），不返回方案"
+>   ]
+> }
+> ```
+>
+> 三台断路器串级（CB1→CB2→CB3）时，故障在 CB3 下，若违规配对 (CB3, CB1)
+> 的两台断路器**都未指定倍率**（只选了无关的 CB2），报“未调整配对违规”：
+>
+> ```json
+> {
+>   "detail": [
+>     "故障 'FX' 的主保护 'CB3' 与上级 'CB1' 均未指定倍率（恒为 1），原始最小比值 m=1.5 < R=1.8，未调整配对违规"
+>   ]
+> }
+> ```
+>
+> 未知 id、倒置区间、空列表等参数错误同样为 **422**：
+>
+> ```json
+> {"detail": ["断路器 id 未知: 'CB9'（场景中不存在该断路器）"]}
+> ```
+
+### 6. 错误示例：非树拓扑（HTTP 422）
 
 ```bash
 curl -s -X POST http://localhost:8000/scenarios \
@@ -276,7 +431,7 @@ curl -s -X POST http://localhost:8000/scenarios \
 {"detail": ["节点 'A' 的入度为 2（树中应为 1），拓扑不是树"]}
 ```
 
-### 6. 错误示例：路径上曲线覆盖不足（HTTP 422）
+### 7. 错误示例：路径上曲线覆盖不足（HTTP 422）
 
 故障区间 `[5, 500]` 超出曲线电流范围 `[10, 100]`（禁止外推）：
 
@@ -293,12 +448,14 @@ curl -s -X POST http://localhost:8000/scenarios \
 
 ```
 ├── app/
-│   ├── main.py       # FastAPI 入口与路由
-│   ├── core.py       # 领域校验 + 选择性分析引擎（log-log 分段求值）
-│   ├── schemas.py    # Pydantic 请求/响应模型
-│   └── db.py         # SQLite 场景仓库（不可变文档）
-├── tests/test_api.py # 端到端与算法单元测试（23 例）
+│   ├── main.py          # FastAPI 入口与路由
+│   ├── core.py          # 领域校验 + 选择性分析引擎（log-log 分段求值）
+│   ├── coordination.py  # 倍率配合：差分约束（Bellman-Ford）+ 两级优化 + 调整后核验
+│   ├── schemas.py       # Pydantic 请求/响应模型
+│   └── db.py            # SQLite 场景仓库（不可变文档）
+├── tests/test_api.py    # 端到端与算法单元测试（38 例）
 ├── examples/scenario.json
+├── examples/coordination-plan.json
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

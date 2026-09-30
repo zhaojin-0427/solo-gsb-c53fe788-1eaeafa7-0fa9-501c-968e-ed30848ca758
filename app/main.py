@@ -1,18 +1,43 @@
 """配电保护选择性核验 API（FastAPI 入口）。"""
 from __future__ import annotations
 
+import math
+
 from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .core import DomainError, validate_scenario, verify_scenario
+from .coordination import build_coordination_plan
 from .db import ScenarioStore
 from .schemas import (
+    CoordinationPlanIn,
+    CoordinationPlanOut,
     FaultReportOut,
     ScenarioIn,
     ScenarioOut,
     ScenarioSummary,
     VerifyResponseOut,
 )
+
+
+def _sanitize_json(obj: object) -> object:
+    """把 NaN/±Infinity 替换为字符串，保证 422 错误体是合法 JSON。
+
+    Pydantic 的字段错误会回显原始输入；若客户端提交 NaN，默认错误处理器
+    会因 json.dumps 拒绝非有限浮点而抛 500。
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else str(obj)
+    if isinstance(obj, BaseException):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, (str, int, bool)) or obj is None:
+        return obj
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json(v) for v in obj]
+    return str(obj)
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -30,6 +55,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.exception_handler(DomainError)
     async def domain_error_handler(_: Request, exc: DomainError) -> JSONResponse:
         return JSONResponse(status_code=422, content={"detail": exc.errors})
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(
+        _: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"detail": _sanitize_json(exc.errors())},
+        )
 
     def _get_scenario_or_404(scenario_id: str) -> dict:
         record = app.state.store.get(scenario_id)
@@ -53,6 +87,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 "get_scenario": "GET /scenarios/{id}",
                 "verify_all": "GET /scenarios/{id}/verification",
                 "verify_one": "GET /scenarios/{id}/faults/{fault_id}/verification",
+                "coordination_plan": "POST /scenarios/{id}/coordination-plan",
             },
         }
 
@@ -121,6 +156,20 @@ def create_app(db_path: str | None = None) -> FastAPI:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"故障不存在: {fault_id}",
         )
+
+    # ------------------------------------------------------------------
+    @app.post(
+        "/scenarios/{scenario_id}/coordination-plan",
+        response_model=CoordinationPlanOut,
+        tags=["coordination"],
+        summary="在倍率闭区间内求解配合方案（不改原场景，返回调整后核验）",
+    )
+    def coordination_plan(
+        scenario_id: str, payload: CoordinationPlanIn
+    ) -> CoordinationPlanOut:
+        record = _get_scenario_or_404(scenario_id)
+        scenario = ScenarioIn.model_validate(record)
+        return build_coordination_plan(scenario_id, scenario, payload)
 
     return app
 

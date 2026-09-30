@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 
 import pytest
@@ -451,3 +452,335 @@ def test_persistence_across_restarts(tmp_path):
     with TestClient(create_app(db_file)) as c2:
         assert c2.get(f"/scenarios/{sid}").status_code == 200
         assert c2.get(f"/scenarios/{sid}/verification").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 倍率配合方案 POST /scenarios/{id}/coordination-plan
+# ---------------------------------------------------------------------------
+
+COORD_PAYLOAD = {
+    "name": "coord-feeder",
+    "source": "S",
+    "branches": [
+        {"id": "B1", "from": "S", "to": "A",
+         "breaker": {"id": "CB1", "curve_id": "C_UP"}},
+        {"id": "B2", "from": "A", "to": "B",
+         "breaker": {"id": "CB2", "curve_id": "C_MAIN"}},
+        {"id": "B3", "from": "B", "to": "C"},
+    ],
+    "curves": [
+        {"id": "C_MAIN", "points": [
+            {"current": 10, "time": 10}, {"current": 100, "time": 1},
+            {"current": 1000, "time": 0.1}]},
+        {"id": "C_UP", "points": [
+            {"current": 10, "time": 20}, {"current": 100, "time": 1.5},
+            {"current": 1000, "time": 0.12}]},
+    ],
+    "faults": [
+        # 最小比值 m=1.2 @1000，R=1.8（原核验不合格）
+        {"id": "F1", "branch_id": "B3",
+         "current_min": 10, "current_max": 1000, "r": 1.8},
+        # m=1.2，R=1.1（合格）
+        {"id": "F2", "branch_id": "B3",
+         "current_min": 10, "current_max": 1000, "r": 1.1},
+        # m=1.5，R=1.5（等号合格）
+        {"id": "F3", "branch_id": "B2",
+         "current_min": 10, "current_max": 100, "r": 1.5},
+    ],
+}
+
+
+def post_plan(client, sid, breakers):
+    return client.post(
+        f"/scenarios/{sid}/coordination-plan", json={"breakers": breakers}
+    )
+
+
+def test_coordination_plan_optima_both_selected(client):
+    sid = create_ok(client, COORD_PAYLOAD)
+    resp = post_plan(client, sid, [
+        {"id": "CB1", "k_min": 0.5, "k_max": 2.0},
+        {"id": "CB2", "k_min": 0.5, "k_max": 2.0},
+    ])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    mult = {m["id"]: m for m in body["multipliers"]}
+    # 主目标 z*=0.5 ln(3/2)：k1*=2/√3 的倒数关系 k1=√(3/2), k2=√(2/3)
+    assert mult["CB1"]["k"] == pytest.approx(math.sqrt(1.5), rel=1e-9)
+    assert mult["CB2"]["k"] == pytest.approx(math.sqrt(2 / 3), rel=1e-9)
+    z_star = 0.5 * math.log(1.5)
+    assert mult["CB1"]["ln_k"] == pytest.approx(z_star, abs=1e-9)
+    assert mult["CB2"]["ln_k"] == pytest.approx(-z_star, abs=1e-9)
+    assert body["objective"]["max_abs_ln_k"] == pytest.approx(z_star, abs=1e-9)
+    # 次目标：按 id 字典序
+    assert body["objective"]["lexicographic_ln_k"] == [
+        mult["CB1"]["ln_k"], mult["CB2"]["ln_k"]
+    ]
+    # 倍率按 id 字典序返回
+    assert [m["id"] for m in body["multipliers"]] == ["CB1", "CB2"]
+
+    # 调整后全部故障合格，且边界点恰好满足（等号合格，无违规区间）
+    ver = body["verification"]
+    assert ver["scenario_id"] == sid
+    assert ver["summary"] == {
+        "total": 3, "qualified": 3, "unqualified": 0, "unprotected": 0}
+    f1 = next(f for f in ver["faults"] if f["fault_id"] == "F1")
+    pair = f1["pairs"][0]
+    assert pair["qualified"] is True
+    assert pair["violations"] == []
+    assert pair["min_ratio"] == pytest.approx(1.8, abs=1e-8)
+    assert pair["min_ratio_current"] == pytest.approx(1000.0)
+
+
+def test_coordination_plan_only_main_selected(client):
+    # 仅选主保护 CB2：必须把动作时间降到 2/3（z=ln1.5）
+    sid = create_ok(client, COORD_PAYLOAD)
+    resp = post_plan(client, sid, [{"id": "CB2", "k_min": 0.1, "k_max": 2.0}])
+    assert resp.status_code == 200, resp.text
+    m = resp.json()["multipliers"][0]
+    assert m["id"] == "CB2"
+    assert m["k"] == pytest.approx(2 / 3, rel=1e-9)
+    assert resp.json()["objective"]["max_abs_ln_k"] == pytest.approx(
+        math.log(1.5), abs=1e-9)
+    assert resp.json()["verification"]["summary"]["unqualified"] == 0
+
+
+def test_coordination_plan_only_upstream_selected(client):
+    # 仅选上级 CB1：须放慢到 1.5
+    sid = create_ok(client, COORD_PAYLOAD)
+    resp = post_plan(client, sid, [{"id": "CB1", "k_min": 0.1, "k_max": 2.0}])
+    assert resp.status_code == 200, resp.text
+    m = resp.json()["multipliers"][0]
+    assert m["id"] == "CB1"
+    assert m["k"] == pytest.approx(1.5, rel=1e-9)
+    assert resp.json()["verification"]["summary"]["unqualified"] == 0
+
+
+def test_coordination_plan_no_adjustment_when_already_qualified(client):
+    payload = copy.deepcopy(COORD_PAYLOAD)
+    payload["faults"] = [
+        {"id": "F2", "branch_id": "B3",
+         "current_min": 10, "current_max": 1000, "r": 1.1},
+        {"id": "F3", "branch_id": "B2",
+         "current_min": 10, "current_max": 100, "r": 1.5},
+    ]
+    sid = create_ok(client, payload)
+    resp = post_plan(client, sid, [
+        {"id": "CB1", "k_min": 0.5, "k_max": 2.0},
+        {"id": "CB2", "k_min": 0.5, "k_max": 2.0},
+    ])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["objective"]["max_abs_ln_k"] == pytest.approx(0.0, abs=1e-9)
+    assert all(m["k"] == pytest.approx(1.0, abs=1e-9)
+               for m in body["multipliers"])
+
+
+def test_coordination_plan_bound_active_lower_bound(client):
+    # 双侧倍率均 >=1：不能加快主保护，只能放慢上级到 1.5
+    sid = create_ok(client, COORD_PAYLOAD)
+    resp = post_plan(client, sid, [
+        {"id": "CB1", "k_min": 1.0, "k_max": 2.0},
+        {"id": "CB2", "k_min": 1.0, "k_max": 2.0},
+    ])
+    assert resp.status_code == 200, resp.text
+    mult = {m["id"]: m for m in resp.json()["multipliers"]}
+    assert mult["CB1"]["k"] == pytest.approx(1.5, rel=1e-9)
+    assert mult["CB2"]["k"] == pytest.approx(1.0, abs=1e-9)
+
+
+def test_coordination_plan_conflict_pinned_at_one(client):
+    sid = create_ok(client, COORD_PAYLOAD)
+    resp = post_plan(client, sid, [
+        {"id": "CB1", "k_min": 1.0, "k_max": 1.0},
+        {"id": "CB2", "k_min": 1.0, "k_max": 1.0},
+    ])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert any("约束冲突" in d for d in detail)
+    assert not any("未调整" in d for d in detail)
+
+
+def test_coordination_plan_conflict_tight_bounds(client):
+    sid = create_ok(client, COORD_PAYLOAD)
+    resp = post_plan(client, sid, [
+        {"id": "CB1", "k_min": 1.0, "k_max": 1.0},
+        {"id": "CB2", "k_min": 0.8, "k_max": 1.2},
+    ])
+    assert resp.status_code == 422
+    assert any("约束冲突" in d for d in resp.json()["detail"])
+
+
+def test_coordination_plan_unadjusted_pair_violation(client):
+    # 三台断路器链：故障在 CB3 下；(CB3,CB1) 原始 m=1.5<1.8，
+    # 仅选择与之无关的 CB2 => 未调整配对违规（单独报，不报约束冲突）。
+    payload = copy.deepcopy(COORD_PAYLOAD)
+    payload["branches"] = [
+        {"id": "L1", "from": "S", "to": "A",
+         "breaker": {"id": "CB1", "curve_id": "C1"}},
+        {"id": "L2", "from": "A", "to": "B",
+         "breaker": {"id": "CB2", "curve_id": "C2"}},
+        {"id": "L3", "from": "B", "to": "C",
+         "breaker": {"id": "CB3", "curve_id": "C3"}},
+    ]
+    payload["curves"] = [
+        {"id": "C1", "points": [
+            {"current": 10, "time": 1.5}, {"current": 100, "time": 0.15}]},
+        {"id": "C2", "points": [
+            {"current": 10, "time": 2.0}, {"current": 100, "time": 0.2}]},
+        {"id": "C3", "points": [
+            {"current": 10, "time": 1.0}, {"current": 100, "time": 0.1}]},
+    ]
+    payload["faults"] = [
+        {"id": "FX", "branch_id": "L3",
+         "current_min": 10, "current_max": 100, "r": 1.8},
+    ]
+    sid = create_ok(client, payload)
+    resp = post_plan(client, sid, [{"id": "CB2", "k_min": 1.0, "k_max": 2.0}])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert len(detail) == 1
+    assert "未调整配对违规" in detail[0]
+    assert "CB3" in detail[0] and "CB1" in detail[0]
+
+
+def test_coordination_plan_unprotected_fault(client):
+    payload = copy.deepcopy(base_payload())  # 含无保护故障 F5
+    sid = create_ok(client, payload)
+    resp = post_plan(client, sid, [
+        {"id": "CB1", "k_min": 0.5, "k_max": 2.0},
+        {"id": "CB2", "k_min": 0.5, "k_max": 2.0},
+    ])
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert any("无主保护" in d and "F5" in d for d in detail)
+
+
+def test_coordination_plan_empty_fault_set_rejected(client):
+    payload = copy.deepcopy(COORD_PAYLOAD)
+    payload["faults"] = []
+    sid = create_ok(client, payload)
+    resp = post_plan(client, sid, [{"id": "CB1", "k_min": 1.0, "k_max": 2.0}])
+    assert resp.status_code == 422
+    assert "故障集为空" in resp.text
+
+
+def test_coordination_plan_request_validation(client):
+    sid = create_ok(client, COORD_PAYLOAD)
+    # 空断路器列表
+    assert post_plan(client, sid, []).status_code == 422
+    # 未知断路器 id
+    r = post_plan(client, sid, [{"id": "GHOST", "k_min": 1.0, "k_max": 2.0}])
+    assert r.status_code == 422 and "未知" in r.text
+    # 重复 id
+    r = post_plan(client, sid, [
+        {"id": "CB1", "k_min": 1.0, "k_max": 2.0},
+        {"id": "CB1", "k_min": 1.0, "k_max": 1.0},
+    ])
+    assert r.status_code == 422 and "重复" in r.text
+    # 倒置区间
+    r = post_plan(client, sid, [{"id": "CB1", "k_min": 2.0, "k_max": 1.0}])
+    assert r.status_code == 422 and "倒置" in r.text
+    # 非正倍率
+    assert post_plan(client, sid, [
+        {"id": "CB1", "k_min": 0.0, "k_max": 2.0}]).status_code == 422
+    assert post_plan(client, sid, [
+        {"id": "CB1", "k_min": -1.0, "k_max": 2.0}]).status_code == 422
+
+
+def test_coordination_plan_non_finite_multipliers_422(client):
+    # NaN/Infinity 必须返回 422 且错误体仍是合法 JSON（曾因回显 NaN 导致 500）
+    sid = create_ok(client, COORD_PAYLOAD)
+    for raw in ("NaN", "Infinity", "-Infinity", "1e999"):
+        body = (
+            '{"breakers": [{"id": "CB1", "k_min": 1.0, "k_max": '
+            + raw + "} ]}"
+        )
+        resp = client.post(
+            f"/scenarios/{sid}/coordination-plan",
+            content=body, headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422, raw
+        json.loads(resp.text)  # 不抛异常即合法 JSON
+
+
+def test_coordination_plan_unknown_scenario_404(client):
+    assert post_plan(client, "nope", [
+        {"id": "CB1", "k_min": 1.0, "k_max": 2.0}]).status_code == 404
+
+
+def test_coordination_plan_does_not_mutate_scenario(client):
+    sid = create_ok(client, COORD_PAYLOAD)
+    post_plan(client, sid, [
+        {"id": "CB1", "k_min": 0.5, "k_max": 2.0},
+        {"id": "CB2", "k_min": 0.5, "k_max": 2.0},
+    ])
+    # 原核验结论不变（F1 仍不合格）
+    orig = client.get(f"/scenarios/{sid}/verification").json()
+    assert orig["summary"] == {
+        "total": 3, "qualified": 2, "unqualified": 1, "unprotected": 0}
+    # 原场景文档无倍率字段
+    doc = client.get(f"/scenarios/{sid}").json()
+    assert "multipliers" not in doc
+    # 多次调用结果一致（无状态）
+    again = post_plan(client, sid, [
+        {"id": "CB1", "k_min": 0.5, "k_max": 2.0},
+        {"id": "CB2", "k_min": 0.5, "k_max": 2.0},
+    ]).json()
+    first = post_plan(client, sid, [
+        {"id": "CB1", "k_min": 0.5, "k_max": 2.0},
+        {"id": "CB2", "k_min": 0.5, "k_max": 2.0},
+    ]).json()
+    assert again["multipliers"] == first["multipliers"]
+
+
+def test_coordination_plan_unselected_breaker_kept_at_one(client):
+    # 两条馈线共用上级 CB1；仅调整 CB2 时，另一馈线的核验不受影响，
+    # 且方案中未列出 CB1（倍率隐含为 1）。
+    payload = copy.deepcopy(COORD_PAYLOAD)
+    payload["branches"] = [
+        {"id": "B1", "from": "S", "to": "A",
+         "breaker": {"id": "CB1", "curve_id": "C_UP"}},
+        {"id": "B2", "from": "A", "to": "B",
+         "breaker": {"id": "CB2", "curve_id": "C_MAIN"}},
+        {"id": "B3", "from": "B", "to": "C"},
+        {"id": "B4", "from": "A", "to": "D",
+         "breaker": {"id": "CB4", "curve_id": "C_MAIN"}},
+    ]
+    payload["faults"] = [
+        {"id": "F1", "branch_id": "B3",
+         "current_min": 10, "current_max": 1000, "r": 1.8},
+    ]
+    sid = create_ok(client, payload)
+    resp = post_plan(client, sid, [{"id": "CB2", "k_min": 0.1, "k_max": 2.0}])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert [m["id"] for m in body["multipliers"]] == ["CB2"]
+    assert body["multipliers"][0]["k"] == pytest.approx(2 / 3, rel=1e-9)
+    # CB2 与 CB4 共用同一条曲线 C_MAIN：CB4 的动作时间不得被缩放。
+    # （本场景下 CB4 不出现在任何故障路径；主要保证求解仅乘所选断路器。）
+    assert body["verification"]["summary"]["unqualified"] == 0
+
+
+def test_coordination_plan_equality_boundary_feasible(client):
+    # 需要的倍率恰好落在边界上时（等号合格）：CB1 固定为 1，则
+    # m*k上/k主 = 1.2*1/k_CB2 >= 1.8 要求 k_CB2 <= 2/3；下界恰为 2/3 时可行。
+    sid = create_ok(client, COORD_PAYLOAD)
+    resp = post_plan(client, sid, [
+        {"id": "CB1", "k_min": 1.0, "k_max": 1.0},
+        {"id": "CB2", "k_min": 2 / 3, "k_max": 2.0},
+    ])
+    assert resp.status_code == 200, resp.text
+    mult = {m["id"]: m for m in resp.json()["multipliers"]}
+    assert mult["CB2"]["k"] == pytest.approx(2 / 3, abs=1e-9)
+    assert mult["CB1"]["k"] == pytest.approx(1.0, abs=1e-9)
+    assert resp.json()["verification"]["summary"]["unqualified"] == 0
+
+    # 下界仅比 2/3 大一丁点 => 无解（约束冲突）
+    tight = post_plan(client, sid, [
+        {"id": "CB1", "k_min": 1.0, "k_max": 1.0},
+        {"id": "CB2", "k_min": 2 / 3 + 1e-6, "k_max": 2.0},
+    ])
+    assert tight.status_code == 422
+    assert any("约束冲突" in d for d in tight.json()["detail"])
